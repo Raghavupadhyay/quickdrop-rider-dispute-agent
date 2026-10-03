@@ -1,6 +1,48 @@
-# Starter file. Add your own services (your app, Postgres) next to payswift. Leave payswift as it is.
+# `docker compose up` starts everything: the dispute-desk service, Postgres and the PaySwift sandbox.
+# payswift is the starter service from ProcureYard and is left as it is.
 services:
   payswift:
     build: ./payswift
     ports:
       - "8081:8081"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: quickdrop
+    # Not published on the host on purpose: only the app needs it, and this avoids
+    # clashing with a Postgres already running on port 5432.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d quickdrop"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@postgres:5432/quickdrop
+      PAYSWIFT_BASE_URL: http://payswift:8081
+      # Read from .env in this directory (see .env.example). Without a key the agent
+      # still runs, using its rule-based extractor instead of the LLM.
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      payswift:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)\""]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
