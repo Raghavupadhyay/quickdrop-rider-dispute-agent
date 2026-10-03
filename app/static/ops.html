@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuickDrop Dispute Desk · Ops</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --muted:#6b7280; --line:#e5e7eb; --ok:#15803d; --warn:#b45309; --bad:#b91c1c; --accent:#1d4ed8; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; color:var(--ink); background:var(--bg); }
+  header { display:flex; align-items:center; gap:16px; padding:12px 20px; background:#fff; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:2; }
+  header h1 { font-size:16px; margin:0; }
+  header .meta { color:var(--muted); margin-left:auto; font-size:12px; }
+  main { display:grid; grid-template-columns: 380px 300px 1fr; gap:16px; padding:16px 20px; min-height:calc(100vh - 50px); }
+  @media (max-width: 1100px) { main { grid-template-columns:1fr; } }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; overflow:auto; max-height:calc(100vh - 90px); }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:0 0 10px; }
+  .item { border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:10px; }
+  .item .top { display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
+  .pill { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); color:var(--muted); white-space:nowrap; }
+  .pill.approval { color:var(--warn); border-color:#fcd34d; background:#fffbeb; }
+  .pill.escalation { color:var(--bad); border-color:#fca5a5; background:#fef2f2; }
+  .pill.approved, .pill.closed { color:var(--ok); border-color:#86efac; background:#f0fdf4; }
+  .pill.rejected { color:var(--muted); }
+  .amt { font-weight:600; }
+  .reason { margin:6px 0; }
+  .muted { color:var(--muted); font-size:12px; }
+  button { font:inherit; border:1px solid var(--line); background:#fff; border-radius:6px; padding:5px 10px; cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--bad); border-color:#fca5a5; }
+  button:disabled { opacity:.5; cursor:default; }
+  .actions { display:flex; gap:8px; margin-top:8px; }
+  .rider { display:flex; justify-content:space-between; padding:8px 10px; border-radius:6px; cursor:pointer; }
+  .rider:hover, .rider.active { background:#eef2ff; }
+  .msg { padding:8px 10px; border-radius:8px; margin:6px 0; max-width:92%; white-space:pre-wrap; }
+  .msg.rider { background:#f3f4f6; }
+  .msg.agent { background:#dbeafe; margin-left:auto; }
+  .msg .muted { display:block; margin-top:4px; }
+  .step { border-left:3px solid var(--line); padding:4px 10px; margin:6px 0; }
+  .step.tool_call { border-color:#60a5fa; } .step.decision { border-color:#f59e0b; } .step.reply { border-color:#34d399; } .step.error { border-color:#ef4444; } .step.message_in { border-color:#a78bfa; }
+  .step summary { cursor:pointer; }
+  pre { background:#0f172a; color:#e2e8f0; padding:8px; border-radius:6px; overflow:auto; font-size:12px; margin:6px 0 0; }
+  .tabs { display:flex; gap:6px; margin-bottom:10px; }
+  .tabs button.on { background:#eef2ff; border-color:#c7d2fe; }
+  .empty { color:var(--muted); padding:12px; text-align:center; }
+  .toast { position:fixed; bottom:16px; right:16px; background:#111827; color:#fff; padding:10px 14px; border-radius:8px; opacity:0; transition:opacity .2s; }
+  .toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>QuickDrop · Rider Payout Dispute Desk</h1>
+  <span class="pill" id="pending-count">…</span>
+  <span class="meta">Auto-refreshes every 5s · <a href="/docs">API docs</a></span>
+</header>
+<main>
+  <section>
+    <div class="tabs">
+      <button class="on" data-filter="pending">Waiting for ops</button>
+      <button data-filter="all">History</button>
+    </div>
+    <div id="items"></div>
+  </section>
+  <section>
+    <h2>Conversations</h2>
+    <div id="riders"></div>
+  </section>
+  <section>
+    <h2 id="conv-title">Select a rider</h2>
+    <div id="conversation"></div>
+    <h2 style="margin-top:16px">What the agent did</h2>
+    <div id="trace"></div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+let filter = 'pending', activeRider = null;
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const when = (iso) => iso ? new Date(iso).toLocaleString('en-IN', {timeZone:'Asia/Kolkata', hour12:false}) : '';
+const toast = (t) => { const el = $('#toast'); el.textContent = t; el.classList.add('show'); setTimeout(() => el.classList.remove('show'), 2500); };
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.detail || r.statusText);
+  return body;
+}
+
+function renderItems(items) {
+  $('#pending-count').textContent = `${items.filter(i => i.status === 'pending').length} waiting`;
+  const box = $('#items');
+  if (!items.length) { box.innerHTML = '<div class="empty">Nothing here.</div>'; return; }
+  box.innerHTML = items.map(i => `
+    <div class="item">
+      <div class="top">
+        <div><a href="#" data-rider="${esc(i.rider_id)}" class="rider-link"><b>${esc(i.rider_id)}</b></a>
+          ${i.amount != null ? `<span class="amt"> · ₹${i.amount}</span>` : ''}</div>
+        <span class="pill ${i.type}">${i.type}</span>
+      </div>
+      <div class="reason">${esc(i.reason)}</div>
+      <div class="muted">#${i.id} · ${when(i.created_at)}${i.reference_key ? ' · ' + esc(i.reference_key) : ''}
+        ${i.status !== 'pending' ? ` · <span class="pill ${i.status}">${i.status}</span>` : ''}</div>
+      ${i.status === 'pending' ? `
+      <div class="actions">
+        <button class="primary" data-act="approve" data-id="${i.id}">${i.type === 'approval' ? 'Approve & pay' : 'Mark handled'}</button>
+        <button class="danger" data-act="reject" data-id="${i.id}">Reject</button>
+      </div>` : ''}
+    </div>`).join('');
+}
+
+function renderRiders(convs) {
+  const box = $('#riders');
+  if (!convs.length) { box.innerHTML = '<div class="empty">No messages yet.</div>'; return; }
+  box.innerHTML = convs.map(c => `
+    <div class="rider ${c.rider_id === activeRider ? 'active' : ''}" data-rider="${esc(c.rider_id)}">
+      <span><b>${esc(c.rider_id)}</b> <span class="muted">· ${c.messages.length} msg</span></span>
+      <span class="muted">${when(c.last_at)}</span>
+    </div>`).join('');
+}
+
+function renderConversation(conv) {
+  $('#conv-title').textContent = conv ? `Rider ${conv.rider_id}` : 'Select a rider';
+  const box = $('#conversation');
+  if (!conv) { box.innerHTML = ''; return; }
+  box.innerHTML = conv.messages.map(m => `
+    <div class="msg rider">${esc(m.text)}<span class="muted">${when(m.received_at)} · ${esc(m.message_id)}</span></div>
+    ${m.reply ? `<div class="msg agent">${esc(m.reply)}<span class="muted">agent · ${m.status}</span></div>` : ''}`).join('');
+}
+
+function renderTrace(steps) {
+  const box = $('#trace');
+  if (!steps.length) { box.innerHTML = '<div class="empty">No steps.</div>'; return; }
+  box.innerHTML = steps.map(s => `
+    <details class="step ${s.type}">
+      <summary><span class="pill">${s.type}</span> <b>${esc(s.name)}</b> <span class="muted">${when(s.at)}</span>
+        ${s.type === 'reply' ? `<div class="muted">${esc(s.output)}</div>` : ''}</summary>
+      <pre>${esc(JSON.stringify({input: s.input, output: s.output}, null, 2))}</pre>
+    </details>`).join('');
+}
+
+let convCache = [];
+async function refresh() {
+  try {
+    const [items, convs] = await Promise.all([
+      api(`/ops/items?status=${filter}`), api('/ops/conversations'),
+    ]);
+    convCache = convs;
+    renderItems(items); renderRiders(convs);
+    if (activeRider) {
+      renderConversation(convs.find(c => c.rider_id === activeRider) || {rider_id: activeRider, messages: []});
+      renderTrace(await api(`/trace/${activeRider}`));
+    }
+  } catch (e) { toast('Refresh failed: ' + e.message); }
+}
+
+document.addEventListener('click', async (ev) => {
+  const t = ev.target.closest('[data-act]');
+  if (t) {
+    t.disabled = true;
+    try { await api(`/ops/pending/${t.dataset.id}/${t.dataset.act}`, {method: 'POST'}); toast(`Item #${t.dataset.id} ${t.dataset.act}d`); }
+    catch (e) { toast(e.message); }
+    refresh(); return;
+  }
+  const r = ev.target.closest('[data-rider]');
+  if (r) { ev.preventDefault(); activeRider = r.dataset.rider; refresh(); return; }
+  const f = ev.target.closest('[data-filter]');
+  if (f) { filter = f.dataset.filter; document.querySelectorAll('[data-filter]').forEach(b => b.classList.toggle('on', b === f)); refresh(); }
+});
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

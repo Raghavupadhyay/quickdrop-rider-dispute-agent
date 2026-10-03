@@ -1,25 +1,28 @@
+import logging
+import time
 from datetime import datetime
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.ai.client import LLMClient
-from app.ai.extractor import ClaimExtractor
+from app.api.deps import get_agent
+from app.db.database import get_db
+from app.db.models import Message, OpsItem
+from app.services import replies
+from app.services.agent import DisputeAgent
+from app.services.trace_service import Tracer
 
-from app.db.database import SessionLocal
-from app.db.models import Message
 
-from app.repositories.trips import TripsRepository
-from app.repositories.payouts import PayoutRepository
-
-from app.services.dispute_resolver import DisputeResolver
-from app.services.message_processor import MessageProcessor
-from app.services.payment_service import PaymentService
-from app.services.trace_service import TraceService
-
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# The vendor resends a message if it has no 2xx after ~10s. Leave a margin.
+REPLY_BUDGET_SECONDS = 9.0
+# How long a redelivery waits for the original request to finish.
+DUPLICATE_WAIT_SECONDS = 6.0
 
 
 class MessageRequest(BaseModel):
@@ -31,159 +34,96 @@ class MessageRequest(BaseModel):
 
 class MessageResponse(BaseModel):
     reply: str
+    duplicate: bool = False
 
 
-def get_db():
-    db = SessionLocal()
-
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-trips_repo = TripsRepository(
-    "data/trips.csv"
-)
-
-payouts_repo = PayoutRepository(
-    "data/payout_lines.csv"
-)
-
-dispute_resolver = DisputeResolver(
-    trips_repo=trips_repo,
-    payouts_repo=payouts_repo,
-)
-
-llm_client = LLMClient()
-
-claim_extractor = ClaimExtractor(
-    llm_client=llm_client,
-)
+def _wait_for_reply(db: Session, message_id: str) -> Message | None:
+    """A redelivery while the original is still being processed: wait for it
+    so both deliveries carry the same real reply instead of a holding text."""
+    waited = 0.0
+    while waited < DUPLICATE_WAIT_SECONDS:
+        time.sleep(0.3)
+        waited += 0.3
+        db.expire_all()
+        message = db.query(Message).filter(Message.message_id == message_id).first()
+        if message is not None and message.status != "processing":
+            return message
+    return None
 
 
-@router.post(
-    "/messages",
-    response_model=MessageResponse,
-)
+@router.post("/messages", response_model=MessageResponse)
 def receive_message(
     payload: MessageRequest,
     db: Session = Depends(get_db),
+    agent: DisputeAgent = Depends(get_agent),
 ):
-    existing = (
-        db.query(Message)
-        .filter(
-            Message.message_id
-            == payload.message_id
-        )
-        .first()
-    )
+    started = time.monotonic()
 
-    if existing:
-        return {
-            "reply": existing.reply
-            or "Message received."
-        }
+    # The message row is written *before* any work, so a redelivery (same
+    # wamid) is never processed, or paid, twice.
+    existing = db.query(Message).filter(Message.message_id == payload.message_id).first()
 
-    trace = TraceService(db)
-
-    trace.log(
-        rider_id=payload.rider_id,
-        event_type="MESSAGE_RECEIVED",
-        details=payload.text,
-    )
-
-    history_rows = (
-        db.query(Message)
-        .filter(
-            Message.rider_id
-            == payload.rider_id
-        )
-        .order_by(
-            Message.received_at.asc()
-        )
-        .all()
-    )
-
-    conversation_history = []
-
-    for row in history_rows[-10:]:
-        conversation_history.append(
-            {
-                "from": "rider",
-                "text": row.text,
-            }
-        )
-
-        if row.reply:
-            conversation_history.append(
-                {
-                    "from": "agent",
-                    "text": row.reply,
-                }
+    if existing is not None:
+        if existing.status == "processing":
+            existing = _wait_for_reply(db, payload.message_id) or existing
+        if existing.status in ("done", "processing"):
+            reply = existing.reply if existing.status == "done" and existing.reply else replies.HOLDING
+            Tracer(db, payload.rider_id, payload.message_id).message_in(
+                "duplicate_delivery",
+                {"message_id": payload.message_id, "text": payload.text, "received_at": payload.received_at.isoformat(),
+                 "note": "vendor redelivered this message; answered with the stored reply, not processed again"},
             )
+            return MessageResponse(reply=reply, duplicate=True)
+        message = existing  # failed earlier: try again
+        message.status = "processing"
+        db.commit()
+    else:
+        message = Message(
+            message_id=payload.message_id,
+            rider_id=payload.rider_id,
+            text=payload.text,
+            received_at=payload.received_at,
+            status="processing",
+        )
+        db.add(message)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            finished = _wait_for_reply(db, payload.message_id)
+            if finished is not None and finished.reply:
+                return MessageResponse(reply=finished.reply, duplicate=True)
+            return MessageResponse(reply=replies.HOLDING, duplicate=True)
 
-    payment_service = PaymentService(
-        db
-    )
+    try:
+        reply = agent.handle(db, message, deadline=started + REPLY_BUDGET_SECONDS)
+        message.reply = reply
+        message.status = "done"
+        db.commit()
+        return MessageResponse(reply=reply)
+    except Exception as exc:  # never leave the rider without an answer
+        logger.exception("agent failed for %s", payload.message_id)
+        db.rollback()
+        error = f"{type(exc).__name__}: {exc}"
 
-    message_processor = MessageProcessor(
-        dispute_resolver=dispute_resolver,
-        payment_service=payment_service,
-        claim_extractor=claim_extractor,
-    )
+        tracer = Tracer(db, payload.rider_id, payload.message_id)
+        tracer.error("agent_failure", {"text": payload.text}, {"error": error})
 
-    result = message_processor.process(
-        rider_id=payload.rider_id,
-        text=payload.text,
-        received_at=payload.received_at,
-        conversation_history=conversation_history,
-    )
-
-    reply = result["reply"]
-
-    trace.log(
-        rider_id=payload.rider_id,
-        event_type="CLAIMS_EXTRACTED",
-        details=str(
-            result.get("parsed")
-        ),
-    )
-
-    trace.log(
-        rider_id=payload.rider_id,
-        event_type="DISPUTE_RESOLVED",
-        details=str(
-            result.get("resolutions")
-        ),
-    )
-
-    trace.log(
-        rider_id=payload.rider_id,
-        event_type="PAYMENT_DECISION",
-        details=str(
-            result.get("payments")
-        ),
-    )
-
-    message = Message(
-        message_id=payload.message_id,
-        rider_id=payload.rider_id,
-        text=payload.text,
-        received_at=payload.received_at,
-        reply=reply,
-    )
-
-    db.add(message)
-    db.commit()
-    db.refresh(message)
-
-    trace.log(
-        rider_id=payload.rider_id,
-        event_type="REPLY_GENERATED",
-        details=reply,
-    )
-
-    return {
-        "reply": reply
-    }
+        db.add(
+            OpsItem(
+                rider_id=payload.rider_id,
+                message_id=payload.message_id,
+                type="escalation",
+                amount=None,
+                reason=f"Agent error while handling a message: {error}",
+                status="pending",
+                details={"text": payload.text},
+            )
+        )
+        message = db.query(Message).filter(Message.message_id == payload.message_id).first()
+        if message is not None:
+            message.reply = replies.SAFE_FALLBACK
+            message.status = "failed"
+        db.commit()
+        tracer.reply(replies.SAFE_FALLBACK)
+        return MessageResponse(reply=replies.SAFE_FALLBACK)

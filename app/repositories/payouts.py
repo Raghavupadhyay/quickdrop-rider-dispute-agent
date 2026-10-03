@@ -5,12 +5,15 @@ from collections import defaultdict
 from datetime import date
 from pathlib import Path
 
+from app.repositories.normalize import normalize_rider_id
+
 
 class PayoutRepository:
     """In-memory view of data/payout_lines.csv: what riders were actually paid.
 
     Line types are `trip`, `daily_incentive` and `cancellation_penalty`
     (penalties are negative). payout_date is the IST day of the trip.
+    Rider ids are normalised the same way as in the trips export.
     """
 
     def __init__(self, csv_path: str):
@@ -19,6 +22,8 @@ class PayoutRepository:
 
         with open(Path(csv_path), newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
+                row["rider_id"] = normalize_rider_id(row["rider_id"])
+                row["trip_id"] = (row["trip_id"] or "").strip().upper()
                 row["amount"] = int(row["amount"])
                 row["payout_date"] = date.fromisoformat(row["payout_date"])
 
@@ -26,7 +31,7 @@ class PayoutRepository:
                 self._by_rider[row["rider_id"]].append(row)
 
     def _rider_lines(self, rider_id: str) -> list[dict]:
-        return self._by_rider.get(rider_id, [])
+        return self._by_rider.get(normalize_rider_id(rider_id), [])
 
     def get_trip_payout(self, rider_id: str, trip_id: str) -> int:
         """Sum of `trip` lines paid for this trip."""

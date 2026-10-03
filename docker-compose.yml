@@ -32,7 +32,7 @@ services:
       # Read from .env in this directory (see .env.example). Without a key the agent
       # still runs, using its rule-based extractor instead of the LLM.
       GROQ_API_KEY: ${GROQ_API_KEY:-}
-      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-120b}
     depends_on:
       postgres:
         condition: service_healthy

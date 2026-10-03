@@ -1,45 +1,31 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from app.db.database import SessionLocal
-from app.db.models import TraceEvent
+from app.db.database import get_db
+from app.db.models import TraceStep
 
 
 router = APIRouter()
 
 
-def get_db():
-    db = SessionLocal()
-
-    try:
-        yield db
-    finally:
-        db.close()
+def step_to_dict(step: TraceStep) -> dict:
+    return {
+        "at": step.at.isoformat(),
+        "type": step.type,
+        "name": step.name,
+        "input": step.input,
+        "output": step.output,
+        "message_id": step.message_id,
+    }
 
 
 @router.get("/trace/{rider_id}")
-def get_trace(
-    rider_id: str,
-    db: Session = Depends(get_db),
-):
-    events = (
-        db.query(TraceEvent)
-        .filter(
-            TraceEvent.rider_id == rider_id
-        )
-        .order_by(
-            TraceEvent.created_at.asc(),
-            TraceEvent.id.asc(),
-        )
+def get_trace(rider_id: str, db: Session = Depends(get_db)):
+    """Everything the agent did for this rider, in order."""
+    steps = (
+        db.query(TraceStep)
+        .filter(TraceStep.rider_id == rider_id)
+        .order_by(TraceStep.at.asc(), TraceStep.id.asc())
         .all()
     )
-
-    return [
-        {
-            "id": event.id,
-            "event_type": event.event_type,
-            "details": event.details,
-            "created_at": event.created_at,
-        }
-        for event in events
-    ]
+    return [step_to_dict(step) for step in steps]
